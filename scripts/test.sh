@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
-# Compila e corre os testes
-set -e
+# Compila e corre todos os testes.
+set -euo pipefail
 cd "$(dirname "$0")/.."
+
 ./scripts/build.sh
-java -cp out mensageiro.TestRunner
+
+# O separador do classpath é ':' em Linux/Mac e ';' em Windows (Git Bash)
+SEP=":"
+case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) SEP=";";; esac
+
+java -cp "out/main${SEP}out/test" mensageiro.TestRunner
