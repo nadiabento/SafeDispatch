@@ -4,7 +4,8 @@ import java.util.List;
 
 public final class TestRunner {
     public static void main(String[] args) throws Exception {
-        List<Class<?>> classes = List.of(SmokeTest.class, FrameTest.class, CodecTest.class);
+        List<Class<?>> classes = List.of(SmokeTest.class, FrameTest.class, CodecTest.class,
+        BytesKdfTest.class, EnvelopeTest.class, ProofsTest.class, KeyVaultTest.class);
         int ok = 0, fail = 0;
         for (Class<?> c : classes) {
             for (var m : c.getDeclaredMethods()) {
