@@ -1,2 +1,10 @@
 bin/
 bin/
+
+out/
+dist/
+data/
+*.key
+*.p12
+*.jks
+*.pem
