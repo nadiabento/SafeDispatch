@@ -19,10 +19,10 @@ Restrições do projeto: só bibliotecas do JDK (JCA), sockets TCP (`java.net.So
 
 ## Equipa
 
-| Elemento | Responsabilidade                                     |
-| -------- | ---------------------------------------------------- |
-| Nadia    | Relay e protocolo (`relay/`, `common/protocol/`)     |
-| Jessica  | Cliente e criptografia (`client/`, `common/crypto/`) |
+| Elemento | Responsabilidade                                                    |
+| -------- | ------------------------------------------------------------------- |
+| Nadia    | Relay e protocolo (`relay/`, `common/protocol/`), módulo C          |
+| Jessica  | Cliente e criptografia (`client/`, `common/crypto/`), módulos A e B |
 
 Detalhes em `docs/DIVISAO.md`.
 
@@ -105,3 +105,28 @@ docs/                       protocolo, arquitetura, ameaças, decisões
 | `docs/ameacas.md`     | Análise de ameaças, mitigações e limitações  |
 | `docs/decisoes/`      | Decisões de segurança justificadas           |
 | `docs/DIVISAO.md`     | Divisão do trabalho                          |
+
+## Fluxo de trabalho
+
+Ver `CONTRIBUTING.md`. Resumo: cada pessoa trabalha na sua branch, abre um Pull Request para a `main` e a outra pessoa revê antes do merge.
+
+
+## Como executar
+
+Requisitos: JDK 17 ou superior (`javac` e `java` no PATH). Em Windows usar o Git Bash. Todos os comandos a partir da raiz do repositório.
+
+```bash
+./scripts/build.sh                                  # compila para out/
+./scripts/test.sh                                   # corre todos os testes
+./scripts/run-relay.sh 5000                         # terminal 1: relay (cria data/relay.pub na primeira vez)
+./scripts/run-client.sh 127.0.0.1 5000 data/relay.pub   # terminal 2: cliente da Alice
+./scripts/run-client.sh 127.0.0.1 5000 data/relay.pub   # terminal 3: cliente do Bob
+```
+
+No cliente da Alice: `register alice` (pede uma palavra-passe e cria o cofre em `data/client/alice.vault`). No do Bob: `register bob`.
+Depois, na Alice: `send bob Olá Bob!` — a mensagem aparece no terminal do Bob.
+Nas execuções seguintes usa-se `login alice` (abre o cofre) em vez de `register`.
+Comandos: `register <id>`, `login <id>`, `lookup <id>`, `send <id> <texto>`, `me`, `help`, `quit`.
+
+O relay mostra a sua impressão digital no arranque; confirme-a por um canal de confiança antes de distribuir a `relay.pub`.
+Na primeira vez que se fala com alguém, o cliente mostra a impressão digital dessa pessoa: compare-a por outro canal (voz, pessoalmente).

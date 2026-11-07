@@ -20,6 +20,7 @@ public final class Proofs {
 
     private static final byte[] LABEL_REGISTER = Bytes.utf8("SafeDispatch/register/v1");
     private static final byte[] LABEL_AUTH = Bytes.utf8("SafeDispatch/auth/v1");
+    private static final byte[] LABEL_RELAY = Bytes.utf8("SafeDispatch/relay-challenge/v1");
 
     // ---------------- bytes que são assinados ----------------
 
@@ -32,6 +33,16 @@ public final class Proofs {
     /** AUTH: resposta ao desafio aleatório que o relay envia no login. */
     public static byte[] msgAuth(String userId, byte[] challenge) {
         return new Bytes.Writer().field(LABEL_AUTH).string(userId).field(challenge).toBytes();
+    }
+
+    /**
+     * CHALLENGE: o que o RELAY assina para provar ao cliente que é o relay verdadeiro.
+     * O relay assina com RelayIdentity.sign(msgRelayChallenge(userId, nonce)); o cliente verifica com a
+     * relay.pub que tem guardada. Inclui o userId e o nonce, por isso a assinatura não serve para outro
+     * utilizador nem para outro login (não pode ser repetida).
+     */
+    public static byte[] msgRelayChallenge(String userId, byte[] nonce) {
+        return new Bytes.Writer().field(LABEL_RELAY).string(userId).field(nonce).toBytes();
     }
 
     // ---------------- cliente: assinar ----------------
@@ -59,6 +70,15 @@ public final class Proofs {
 
     public static boolean verifyAuth(PublicKey signKey, String userId, byte[] challenge, byte[] sig) {
         return verify(signKey, msgAuth(userId, challenge), sig);
+    }
+
+    /** Cliente: confirma que o CHALLENGE foi assinado pelo relay cuja chave pública (relay.pub) conhece. */
+    public static boolean verifyRelayChallenge(byte[] relayPubEnc, String userId, byte[] nonce, byte[] sig) {
+        try {
+            return verify(Keys.decodeSigningPublic(relayPubEnc), msgRelayChallenge(userId, nonce), sig);
+        } catch (GeneralSecurityException | RuntimeException e) {
+            return false;
+        }
     }
 
     // ---------------- internos ----------------

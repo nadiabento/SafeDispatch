@@ -74,9 +74,11 @@ public final class TestRunner {
     }
 
     public static void main(String[] args) {
-        // Estilo registerAll (testes da Jessica)
-        BytesKdfTest.registerAll();
-        EnvelopeTest.registerAll();
+        // Estilo testXxx (testes da Jessica)
+        for (Class<?> c : new Class<?>[]{BytesKdfTest.class, EnvelopeTest.class, ProofsTest.class,
+                KeyVaultTest.class, ClientFlowTest.class}) {
+            registerTestMethods(c);
+        }
 
         // Estilo testXxx (testes da Nadia)
         for (Class<?> c : new Class<?>[]{SmokeTest.class, FrameTest.class, CodecTest.class, RelayIdentityTest.class}) {

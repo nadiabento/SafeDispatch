@@ -1,7 +1,6 @@
 package mensageiro;
 
 import mensageiro.client.keystore.Identity;
-import mensageiro.common.crypto.Bytes;
 import mensageiro.common.crypto.Proofs;
 
 import static mensageiro.Asserts.*;
