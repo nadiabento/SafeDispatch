@@ -19,10 +19,10 @@ Restrições do projeto: só bibliotecas do JDK (JCA), sockets TCP (`java.net.So
 
 ## Equipa
 
-| Elemento | Responsabilidade                                                    |
-| -------- | ------------------------------------------------------------------- |
-| Nadia    | Relay e protocolo (`relay/`, `common/protocol/`), módulo C          |
-| Jessica  | Cliente e criptografia (`client/`, `common/crypto/`), módulos A e B |
+| Elemento | Responsabilidade                                     |
+| -------- | ---------------------------------------------------- |
+| Nadia    | Relay e protocolo (`relay/`, `common/protocol/`)     |
+| Jessica  | Cliente e criptografia (`client/`, `common/crypto/`) |
 
 Detalhes em `docs/DIVISAO.md`.
 
@@ -105,7 +105,3 @@ docs/                       protocolo, arquitetura, ameaças, decisões
 | `docs/ameacas.md`     | Análise de ameaças, mitigações e limitações  |
 | `docs/decisoes/`      | Decisões de segurança justificadas           |
 | `docs/DIVISAO.md`     | Divisão do trabalho                          |
-
-## Fluxo de trabalho
-
-Ver `CONTRIBUTING.md`. Resumo: cada pessoa trabalha na sua branch, abre um Pull Request para a `main` e a outra pessoa revê antes do merge.
