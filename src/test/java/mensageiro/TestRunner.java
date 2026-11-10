@@ -79,7 +79,7 @@ public final class TestRunner {
         EnvelopeTest.registerAll();
 
         // Estilo testXxx (testes da Nadia)
-        for (Class<?> c : new Class<?>[]{SmokeTest.class, FrameTest.class, CodecTest.class, RelayIdentityTest.class}) {
+        for (Class<?> c : new Class<?>[]{SmokeTest.class, FrameTest.class, CodecTest.class, RelayIdentityTest.class, AuthTest.class}) {
             registerTestMethods(c);
         }
 

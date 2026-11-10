@@ -1,87 +1,202 @@
 package mensageiro.relay.net;
 
 import mensageiro.common.protocol.*;
-import mensageiro.relay.auth.RelayIdentity;
+import mensageiro.relay.auth.Authenticator;
+import mensageiro.relay.auth.Directory;
 
 import java.io.*;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
+import java.security.SecureRandom;
 
-/* Trata UMA ligação de um cliente. Corre numa thread do pool (por isso implementa Runnable).
- 
- * Ciclo de vida:
- *   - lê um frame -> trata a mensagem -> lê o seguinte -> ... até o cliente sair ou haver erro.
-
- * Estado atual: esqueleto. Todas as mensagens respondem ERROR "não implementado".
- * Os comentários TODO em tratar() são o que vai ser preenchido a seguir.
+/*Trata UMA ligação de um cliente (corre numa thread do pool).
+ * Lê frames em ciclo e trata cada tipo de mensagem.
+ * Regras de segurança:
+ *  - Frame ou campos inválidos (ProtocolException): envia ERROR e FECHA a ligação.
+ *  - O remetente de uma mensagem é SEMPRE o utilizador autenticado nesta ligação
+ *    (campo 'utilizador'), nunca algo que o cliente escreva.
+ *  - O relay trata o envelope como bytes opacos: não o abre, não o altera.
  */
 public final class ClientHandler implements Runnable {
-    // Códigos de erro enviados ao cliente (1.º campo do payload de ERROR)
+    // Códigos de erro (1.º campo do payload de ERROR)
     static final int ERRO_PROTOCOLO = 1;
     static final int ERRO_NAO_IMPLEMENTADO = 2;
+    static final int ERRO_PEDIDO_INVALIDO = 3;
+    static final int ERRO_NAO_AUTENTICADO = 4;
+    static final int ERRO_REGISTO_RECUSADO = 5;
+    static final int ERRO_AUTENTICACAO = 6;
+    static final int ERRO_DESTINATARIO = 7;
 
-    private final Socket socket;           // a ligação com este cliente
-    private final RelayIdentity identidade; // chaves do relay (para assinar o desafio)
+    // Tamanhos máximos dos campos (defesa contra campos forjados)
+    static final int MAX_USER = 32;
+    static final int MAX_CHAVE = 128;
+    static final int MAX_ASSINATURA = 128;
+    static final int MAX_ENVELOPE = 512 * 1024;
+    static final int TAMANHO_NONCE = 32;
 
-    /* Quem está autenticado NESTA ligação. É null até o handshake terminar com sucesso.
-     * Regra de segurança: o remetente das mensagens é SEMPRE este campo, nunca o que o
-     * cliente escreve na mensagem. Assim ninguém consegue enviar em nome de outro.
-     */
+    private static final SecureRandom RANDOM = new SecureRandom();
+
+    private final Socket socket;
+    private final Authenticator authenticator;
+    private final Sessions sessions;
+    private OutputStream out;
+
+    /* Utilizador autenticado nesta ligação (null até o handshake terminar com sucesso). */
     private String utilizador = null;
+    /* Desafio pendente (null se não há). É de uso único. */
+    private Authenticator.Desafio desafio = null;
 
-    public ClientHandler(Socket socket, RelayIdentity identidade) {
+    public ClientHandler(Socket socket, Authenticator authenticator, Sessions sessions) {
         this.socket = socket;
-        this.identidade = identidade;
+        this.authenticator = authenticator;
+        this.sessions = sessions;
     }
 
     @Override
     public void run() {
-        // try (socket): o socket fecha sempre no fim, haja ou não erro
-        try (socket) {
+        // Atenção: NÃO usar "try (socket)" aqui. Num try-with-resources o socket fecha ANTES de
+        // correr o catch, e o ERROR que queremos enviar ao cliente perdia-se. Fechamos no finally.
+        try {
             InputStream in = new BufferedInputStream(socket.getInputStream());
-            OutputStream out = socket.getOutputStream();
-
+            out = socket.getOutputStream();
             while (true) {
-                Frame.Message msg = Frame.read(in);   // espera por uma mensagem completa
-                if (msg == null) return;              // null = o cliente fechou a ligação normalmente
-                tratar(msg, out);
+                Frame.Message msg = Frame.read(in);
+                if (msg == null) return;                      // o cliente fechou a ligação
+                tratar(msg);
             }
         } catch (ProtocolException e) {
-            // O cliente enviou um frame inválido (gigante, tipo desconhecido...).
-            // Avisa e fecha: não vale a pena continuar a falar com quem envia lixo.
-            tentarEnviarErro(ERRO_PROTOCOLO, e.getMessage());
+            tentarEnviarErro(ERRO_PROTOCOLO, e.getMessage()); // lixo no protocolo: avisa e fecha
         } catch (SocketTimeoutException e) {
-            // Ficou 60 s sem enviar nada: fecha em silêncio (liberta a thread para outros)
+            // ligação inativa: fecha em silêncio
         } catch (IOException e) {
-            // A ligação cortou: não há nada a fazer
+            // ligação cortada
+        } finally {
+            if (utilizador != null) sessions.remover(utilizador, this);
+            try { socket.close(); } catch (IOException ignorado) { }
         }
     }
 
-    /** Decide o que fazer conforme o tipo da mensagem recebida. */
-    private void tratar(Frame.Message msg, OutputStream out) throws IOException {
+    private void tratar(Frame.Message msg) throws IOException {
         switch (msg.type()) {
-            // TODO REGISTER    -> Authenticator: verificar prova de posse, guardar no Directory
-            // TODO AUTH_HELLO  -> enviar CHALLENGE (nonce + assinatura do relay)
-            // TODO AUTH        -> verificar assinatura do utilizador e preencher 'utilizador'
-            // TODO LOOKUP      -> Directory
-            // TODO SEND        -> usar 'utilizador' como remetente (NUNCA o que o cliente diz)
-
-            // Por agora, tudo o resto responde com um erro
-            default -> enviarErro(out, ERRO_NAO_IMPLEMENTADO, "não implementado: " + msg.type());
+            case REGISTER -> registar(msg.payload());
+            case AUTH_HELLO -> iniciarAutenticacao(msg.payload());
+            case AUTH -> concluirAutenticacao(msg.payload());
+            case LOOKUP -> procurar(msg.payload());
+            case SEND -> enviar(msg.payload());
+            default -> enviarErro(ERRO_NAO_IMPLEMENTADO, "não implementado: " + msg.type());
         }
     }
 
-    /*Envia uma mensagem ERROR: [código (1 byte)] [texto].
-     * synchronized: mais tarde, outra thread pode querer entregar uma mensagem a este
-     * cliente ao mesmo tempo. O synchronized garante que dois frames não se misturam.
-     */
-    private void enviarErro(OutputStream out, int codigo, String texto) throws IOException {
-        byte[] payload = new Codec.Writer().u8(codigo).string(texto).toByteArray();
-        synchronized (out) { Frame.write(out, MessageType.ERROR, payload); }
+    //  REGISTER: nome, chaves e prova de posse
+    private void registar(byte[] payload) throws IOException {
+        var r = new Codec.Reader(payload);
+        String user = r.string(MAX_USER);
+        byte[] pubSign = r.bytes(MAX_CHAVE);
+        byte[] pubKex = r.bytes(MAX_CHAVE);
+        byte[] prova = r.bytes(MAX_ASSINATURA);
+        r.end();
+
+        byte[] cert = authenticator.registar(user, pubSign, pubKex, prova);
+        if (cert == null) { enviarErro(ERRO_REGISTO_RECUSADO, "registo recusado"); return; }
+        enviar(MessageType.REGISTER_OK, new Codec.Writer().bytes(cert).toByteArray());
     }
 
-    /** Tenta enviar o erro, mas se a ligação já cortou, ignora (não há a quem avisar). */
+    //  Handshake, passo 1: AUTH_HELLO -> CHALLENGE 
+    private void iniciarAutenticacao(byte[] payload) throws IOException {
+        var r = new Codec.Reader(payload);
+        String user = r.string(MAX_USER);
+        byte[] nonceCliente = r.bytes(64);
+        r.end();
+
+        if (utilizador != null) { enviarErro(ERRO_PEDIDO_INVALIDO, "já autenticado"); return; }
+        if (nonceCliente.length != TAMANHO_NONCE) { enviarErro(ERRO_PEDIDO_INVALIDO, "nonce inválido"); return; }
+
+        Authenticator.Desafio d = authenticator.iniciar(user, nonceCliente);
+        // Mesma mensagem para "utilizador desconhecido" e para "assinatura errada"
+        if (d == null) { enviarErro(ERRO_AUTENTICACAO, "autenticação falhou"); return; }
+        desafio = d;
+        enviar(MessageType.CHALLENGE,
+                new Codec.Writer().bytes(d.nonceRelay()).bytes(d.assinaturaRelay()).toByteArray());
+    }
+
+    // Handshake, passo 2: AUTH -> AUTH_OK 
+    private void concluirAutenticacao(byte[] payload) throws IOException {
+        var r = new Codec.Reader(payload);
+        byte[] assinatura = r.bytes(MAX_ASSINATURA);
+        r.end();
+
+        Authenticator.Desafio d = desafio;
+        desafio = null;                                        // uso único: gasto mesmo que falhe
+        if (d == null) { enviarErro(ERRO_PROTOCOLO, "AUTH sem AUTH_HELLO"); return; }
+        if (!authenticator.concluir(d, assinatura)) { enviarErro(ERRO_AUTENTICACAO, "autenticação falhou"); return; }
+
+        utilizador = d.utilizador();
+        sessions.registar(utilizador, this);
+        // TODO módulo C: aqui vai o token. Por agora vai vazio, com expiração 0.
+        enviar(MessageType.AUTH_OK, new Codec.Writer().bytes(new byte[0]).u64(0).toByteArray());
+    }
+
+    // LOOKUP: chaves públicas de outro utilizador (+ certificado do relay) 
+    private void procurar(byte[] payload) throws IOException {
+        var r = new Codec.Reader(payload);
+        String user = r.string(MAX_USER);
+        r.end();
+        if (!exigirAutenticado()) return;
+
+        Directory.Entry e = authenticator.directory().procurar(user);
+        if (e == null) { enviarErro(ERRO_DESTINATARIO, "utilizador desconhecido"); return; }
+        byte[] cert = authenticator.certificado(e.user(), e.pubSign(), e.pubKex());
+        enviar(MessageType.LOOKUP_OK, new Codec.Writer()
+                .string(e.user()).bytes(e.pubSign()).bytes(e.pubKex()).bytes(cert).toByteArray());
+    }
+
+    // SEND: encaminha o envelope para o destinatário, se estiver ligado
+    private void enviar(byte[] payload) throws IOException {
+        var r = new Codec.Reader(payload);
+        String destinatario = r.string(MAX_USER);
+        byte[] envelope = r.bytes(MAX_ENVELOPE);
+        r.end();
+        if (!exigirAutenticado()) return;
+
+        ClientHandler alvo = sessions.obter(destinatario);
+        if (alvo == null) {
+            // TODO Entrega 2: guardar a mensagem (armazenamento diferido)
+            enviarErro(ERRO_DESTINATARIO, "destinatário desconhecido ou offline");
+            return;
+        }
+        byte[] msgId = new byte[16];
+        RANDOM.nextBytes(msgId);
+        try {
+            alvo.entregar(utilizador, msgId, envelope);        // 'utilizador' = remetente autenticado
+        } catch (IOException e) {
+            enviarErro(ERRO_DESTINATARIO, "não foi possível entregar");
+            return;
+        }
+        enviar(MessageType.SEND_OK, new Codec.Writer().bytes(msgId).toByteArray());
+    }
+
+    /* Chamado por OUTRA thread (a do remetente) para entregar uma mensagem a este cliente. */
+    void entregar(String remetente, byte[] msgId, byte[] envelope) throws IOException {
+        enviar(MessageType.DELIVER,
+                new Codec.Writer().string(remetente).bytes(msgId).bytes(envelope).toByteArray());
+    }
+
+    private boolean exigirAutenticado() throws IOException {
+        if (utilizador != null) return true;
+        enviarErro(ERRO_NAO_AUTENTICADO, "autenticação necessária");
+        return false;
+    }
+
+    /* Escritas sincronizadas: a thread do remetente e a desta ligação podem escrever ao mesmo tempo. */
+    private void enviar(MessageType tipo, byte[] payload) throws IOException {
+        synchronized (out) { Frame.write(out, tipo, payload); }
+    }
+
+    private void enviarErro(int codigo, String texto) throws IOException {
+        enviar(MessageType.ERROR, new Codec.Writer().u8(codigo).string(texto).toByteArray());
+    }
+
     private void tentarEnviarErro(int codigo, String texto) {
-        try { enviarErro(socket.getOutputStream(), codigo, texto); } catch (IOException ignorado) { }
+        try { if (out != null) enviarErro(codigo, texto); } catch (IOException ignorado) { }
     }
 }
