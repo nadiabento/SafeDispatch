@@ -15,7 +15,8 @@ import java.security.KeyPairGenerator;
 import java.security.SecureRandom;
 import java.util.Arrays;
 
-/*Testes do relay com um servidor e clientes REAIS (sockets TCP numa porta livre).
+/**
+ * Testes do relay com um servidor e clientes REAIS (sockets TCP numa porta livre).
  * Cada teste arranca o seu próprio relay, com identidade nova.
  */
 public final class AuthTest {
@@ -47,7 +48,7 @@ public final class AuthTest {
         /** REGISTER com a prova assinada por 'chaveProva' (a do cliente, ou outra, para testar fraudes). */
         Frame.Message registar(KeyPair chaveProva) throws Exception {
             byte[] ps = sign.getPublic().getEncoded(), pk = kex.getPublic().getEncoded();
-            byte[] prova = Proofs.sign(chaveProva.getPrivate(), Proofs.registerMsg(user, ps, pk));
+            byte[] prova = Proofs.signRegister(chaveProva.getPrivate(), user, ps, pk);
             enviar(MessageType.REGISTER, new Codec.Writer().string(user).bytes(ps).bytes(pk).bytes(prova).toByteArray());
             return receber();
         }
@@ -55,16 +56,14 @@ public final class AuthTest {
 
         /** Handshake completo. Devolve a resposta final (AUTH_OK ou ERROR). */
         Frame.Message autenticar(byte[] relayPub) throws Exception {
-            byte[] nc = new byte[32];
-            RANDOM.nextBytes(nc);
-            enviar(MessageType.AUTH_HELLO, new Codec.Writer().string(user).bytes(nc).toByteArray());
+            enviar(MessageType.AUTH_HELLO, new Codec.Writer().string(user).toByteArray());
             var ch = receber();
             check(ch.type() == MessageType.CHALLENGE, "esperava CHALLENGE, veio " + ch.type());
             var r = new Codec.Reader(ch.payload());
-            byte[] nr = r.bytes(64), sigRelay = r.bytes(128);
+            byte[] nonce = r.bytes(64), sigRelay = r.bytes(128);
             // O CLIENTE verifica que o relay é o verdadeiro (é o que impede um relay falso)
-            check(Proofs.verify(relayPub, Proofs.srvMsg(nc, nr, user), sigRelay), "assinatura do relay inválida");
-            byte[] sig = Proofs.sign(sign.getPrivate(), Proofs.authMsg(nc, nr, user));
+            check(Proofs.verifyRelayChallenge(relayPub, user, nonce, sigRelay), "assinatura do relay inválida");
+            byte[] sig = Proofs.signAuth(sign.getPrivate(), user, nonce);
             enviar(MessageType.AUTH, new Codec.Writer().bytes(sig).toByteArray());
             return receber();
         }
@@ -78,22 +77,16 @@ public final class AuthTest {
         check(m != null && m.type() == MessageType.ERROR, quando + ": esperava ERROR, veio " + (m == null ? "nada" : m.type()));
     }
 
-    // Testes 
+    // ---------- testes ----------
 
-    // Registo + autenticação mútua completa; o certificado do relay verifica com a chave pública do relay
+    // Registo + autenticação mútua completa (o cliente verifica o relay, o relay verifica o cliente)
     static void testRegistoEAutenticacao() throws Exception {
         var id = novaIdentidade();
-        try (var relay = new RelayServer(id); ) {
+        try (var relay = new RelayServer(id)) {
             int porta = relay.start(0);
             try (var alice = new Cliente(porta, "alice")) {
-                var ok = alice.registar();
-                check(ok.type() == MessageType.REGISTER_OK, "registo devia ser aceite");
-                byte[] cert = new Codec.Reader(ok.payload()).bytes(128);
-                check(Proofs.verify(id.publicKeyBytes(),
-                        Proofs.certMsg("alice", alice.sign.getPublic().getEncoded(), alice.kex.getPublic().getEncoded()), cert),
-                        "o certificado devia verificar com a chave do relay");
-                var auth = alice.autenticar(id.publicKeyBytes());
-                check(auth.type() == MessageType.AUTH_OK, "autenticação devia ser aceite");
+                check(alice.registar().type() == MessageType.REGISTER_OK, "registo devia ser aceite");
+                check(alice.autenticar(id.publicKeyBytes()).type() == MessageType.AUTH_OK, "autenticação devia ser aceite");
             }
         }
     }
@@ -169,26 +162,21 @@ public final class AuthTest {
         var id = novaIdentidade();
         try (var relay = new RelayServer(id)) {
             int porta = relay.start(0);
-            byte[] nc = new byte[32];
-            RANDOM.nextBytes(nc);
 
-            byte[] sigAntiga;
-            byte[] nr1;
+            byte[] sigAntiga, nonce1;
             try (var alice = new Cliente(porta, "alice")) {
                 alice.registar();
-                alice.enviar(MessageType.AUTH_HELLO, new Codec.Writer().string("alice").bytes(nc).toByteArray());
-                var r = new Codec.Reader(alice.receber().payload());
-                nr1 = r.bytes(64);
-                sigAntiga = Proofs.sign(alice.sign.getPrivate(), Proofs.authMsg(nc, nr1, "alice"));
+                alice.enviar(MessageType.AUTH_HELLO, new Codec.Writer().string("alice").toByteArray());
+                nonce1 = new Codec.Reader(alice.receber().payload()).bytes(64);
+                sigAntiga = Proofs.signAuth(alice.sign.getPrivate(), "alice", nonce1);
                 alice.enviar(MessageType.AUTH, new Codec.Writer().bytes(sigAntiga).toByteArray());
                 check(alice.receber().type() == MessageType.AUTH_OK, "a ligação legítima devia autenticar");
             }
-            // Um atacante captura sigAntiga e tenta reutilizá-la, com o MESMO nonce do cliente
+            // Um atacante captura sigAntiga e tenta reutilizá-la numa ligação nova
             try (var atacante = new Cliente(porta, "alice")) {
-                atacante.enviar(MessageType.AUTH_HELLO, new Codec.Writer().string("alice").bytes(nc).toByteArray());
-                var r = new Codec.Reader(atacante.receber().payload());
-                byte[] nr2 = r.bytes(64);
-                check(!Arrays.equals(nr1, nr2), "o relay devia usar um nonce novo em cada ligação");
+                atacante.enviar(MessageType.AUTH_HELLO, new Codec.Writer().string("alice").toByteArray());
+                byte[] nonce2 = new Codec.Reader(atacante.receber().payload()).bytes(64);
+                check(!Arrays.equals(nonce1, nonce2), "o relay devia usar um nonce novo em cada ligação");
                 atacante.enviar(MessageType.AUTH, new Codec.Writer().bytes(sigAntiga).toByteArray());
                 esperaErro(atacante.receber(), "replay da autenticação");
             }
@@ -219,14 +207,14 @@ public final class AuthTest {
                 check(alice.autenticar(id.publicKeyBytes()).type() == MessageType.AUTH_OK, "alice autentica");
                 check(bob.autenticar(id.publicKeyBytes()).type() == MessageType.AUTH_OK, "bob autentica");
 
-                // Descoberta: a alice obtém as chaves do bob e o certificado verifica
+                // Descoberta: a alice obtém as chaves do bob
                 alice.enviar(MessageType.LOOKUP, new Codec.Writer().string("bob").toByteArray());
                 var lk = alice.receber();
                 check(lk.type() == MessageType.LOOKUP_OK, "lookup");
                 var r = new Codec.Reader(lk.payload());
-                String nome = r.string(32); byte[] ps = r.bytes(128), pk = r.bytes(128), cert = r.bytes(128);
+                String nome = r.string(32); byte[] ps = r.bytes(128), pk = r.bytes(128);
                 check(nome.equals("bob") && Arrays.equals(ps, bob.sign.getPublic().getEncoded()), "chaves do bob");
-                check(Proofs.verify(id.publicKeyBytes(), Proofs.certMsg("bob", ps, pk), cert), "certificado do relay");
+                check(Arrays.equals(pk, bob.kex.getPublic().getEncoded()), "chave de acordo do bob");
 
                 // Envio: bytes opacos que o relay não pode alterar
                 byte[] envelope = new byte[300];

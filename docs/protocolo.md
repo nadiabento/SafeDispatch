@@ -1,52 +1,107 @@
-# Protocolo (versão 1 — Entrega 1)
+# Protocolo do Mensageiro Seguro (SafeDispatch)
 
-> Formato proposto pela pessoa 1 (cliente e criptografia). Os pontos marcados **[Nadia]** têm de ser confirmados com o relay.
+Versão da Entrega 2 (rascunho). Descreve o que o relay implementa e o que o cliente tem de enviar.
 
-## Enquadramento (frame)
-Cada mensagem TCP é `[4 bytes comprimento N][1 byte tipo][N-1 bytes payload]`, big-endian; `N` inclui o byte de tipo.
-Limite `N <= 1 MiB`. Comprimento 0, acima do limite ou tipo desconhecido → ligação recusada, sem alocar memória primeiro.
+## 1. Transporte e framing
 
-## Campos do payload
-Os payloads usam o `Codec`: `string`/`bytes` = `[4 bytes comprimento][dados]`, com tamanho máximo verificado antes de ler.
-O leitor chama `end()` no fim: bytes a mais são recusados.
+- Sockets TCP, sem TLS. A segurança é feita pela nossa camada (assinaturas Ed25519 e envelopes E2E).
+- Cada mensagem é um frame: comprimento (uint32) | tipo (uint8) | payload.
+- Tamanho máximo de um frame: 1 MiB. O comprimento é verificado ANTES de reservar memória,
+  por isso um frame com tamanho forjado (ex.: 2 GB) é recusado sem consumir memória.
+- Sem serialização Java: os campos do payload são codificados à mão (classe Codec).
 
-## Mensagens da Entrega 1
+### Campos do payload (Codec)
 
-| Tipo | Sentido | Payload |
-|---|---|---|
-| `REGISTER` | C→R | `string(id) bytes(signPub) bytes(agreePub) bytes(prova de posse)` (classe `Registration`) |
-| `REGISTER_OK` | R→C | vazio |
-| `AUTH_HELLO` | C→R | `string(id)` |
-| `CHALLENGE` | R→C | `bytes(nonce) bytes(assinatura do relay)`; nonce de 32 bytes aleatórios, novo em cada `AUTH_HELLO`, uso único |
-| `AUTH` | C→R | `bytes(assinatura do cliente sobre o nonce)` |
-| `AUTH_OK` | R→C | token opaco (formato do Módulo C; o cliente guarda-o sem o interpretar) |
-| `LOOKUP` | C→R | `string(id)` |
-| `LOOKUP_OK` | R→C | igual ao payload de `REGISTER` (a entrada do diretório tal como foi registada) |
-| `SEND` | C→R | envelope E2E (bytes crus) |
-| `SEND_OK` | R→C | vazio |
-| `DELIVER` | R→C | envelope E2E, empurrado ao destinatário |
-| `ERROR` | R→C | `u8(código) string(texto)` (como já está no `ClientHandler`) |
+| Tipo         | Codificação                                              |
+| ------------ | -------------------------------------------------------- |
+| u8, u32, u64 | inteiros de tamanho fixo                                 |
+| bytes        | comprimento (u32) + conteúdo; cada leitura tem um máximo |
+| string       | bytes em UTF-8, com o mesmo prefixo e máximo             |
 
-`id`: 1 a 32 caracteres de `[A-Za-z0-9_.-]`. `signPub`: Ed25519 (X.509). `agreePub`: X25519 (X.509).
+- Cada campo é lido com um tamanho máximo (defesa contra campos forjados).
+- No fim de cada mensagem, `end()` recusa bytes a mais.
 
-## Assinaturas (código em `common/crypto/Proofs`, igual para cliente e relay)
-Cada assinatura é Ed25519 sobre bytes com etiqueta própria, construídos pelas mesmas funções nos dois lados:
-- **Registo** — `msgRegister(id, signPub, agreePub)`, etiqueta `SafeDispatch/register/v1`. Prova de posse da chave privada e liga a chave X25519 à identidade.
-- **Autenticação do cliente** — `msgAuth(id, nonce)`, etiqueta `SafeDispatch/auth/v1`.
-- **Autenticação do relay** — `msgRelayChallenge(id, nonce)`, etiqueta `SafeDispatch/relay-challenge/v1`. O relay assina com `RelayIdentity.sign(...)`; o cliente verifica com a `relay.pub` que já tem. Assim o cliente sabe que fala com o relay verdadeiro antes de responder.
-As etiquetas diferentes impedem usar uma assinatura de um contexto noutro.
+## 2. Mensagens
 
-## Envelope E2E (código em `common/crypto/Envelope`)
-`field(corpo) field(assinatura)`. O corpo tem versão, id do remetente, id do destinatário, timestamp, `msgId` aleatório, chave efémera X25519, nonce e texto cifrado.
-- Chave de sessão = HKDF-SHA256(segredo X25519 efémero↔destinatário, contexto com ids e chaves públicas).
-- Cifra AES-256-GCM, com o cabeçalho como dados autenticados (AAD).
-- O remetente assina com Ed25519; o destinatário verifica **antes** de decifrar.
-- O relay só lê o cabeçalho (`Envelope.peek`) para saber a quem entregar; não consegue ler nem alterar o conteúdo.
+| Tipo        | Sentido | Payload                                                    |
+| ----------- | ------- | ---------------------------------------------------------- |
+| REGISTER    | C -> R  | string user, bytes pubSign, bytes pubKex, bytes prova      |
+| REGISTER_OK | R -> C  | vazio                                                      |
+| AUTH_HELLO  | C -> R  | string user                                                |
+| CHALLENGE   | R -> C  | bytes nonce, bytes assinaturaRelay                         |
+| AUTH        | C -> R  | bytes assinaturaCliente                                    |
+| AUTH_OK     | R -> C  | bytes token (vazio por agora), u64 expiração (0 por agora) |
+| LOOKUP      | C -> R  | string user                                                |
+| LOOKUP_OK   | R -> C  | string user, bytes pubSign, bytes pubKex                   |
+| SEND        | C -> R  | string destinatário, bytes envelope                        |
+| SEND_OK     | R -> C  | bytes msgId (16 bytes)                                     |
+| DELIVER     | R -> C  | string remetente, bytes msgId, bytes envelope              |
+| ERROR       | R -> C  | u8 código, string texto                                    |
 
-## O que o relay tem de fazer **[Nadia]**
-1. `REGISTER`: `Registration.decode(payload)` e `reg.valid()`; guardar no diretório; recusar ids repetidos.
-2. `AUTH_HELLO`: gerar nonce (32 bytes), responder `CHALLENGE` com `identidade.sign(Proofs.msgRelayChallenge(id, nonce))`.
-3. `AUTH`: `Proofs.verifyAuth(chave do registo, id, nonce, assinatura)`; invalidar o nonce; preencher `utilizador` na ligação.
-4. `LOOKUP`: devolver a entrada (`Registration.encode()`). Só para clientes autenticados.
-5. `SEND`: o remetente do envelope tem de ser o `utilizador` autenticado; entregar com `DELIVER`.
-O `FakeRelay` em `src/test` é uma implementação mínima destes passos e serve de referência.
+### Códigos de erro
+
+| Código | Significado                                                        |
+| ------ | ------------------------------------------------------------------ |
+| 1      | erro de protocolo (frame ou campos inválidos); a ligação é fechada |
+| 2      | mensagem não implementada                                          |
+| 3      | pedido inválido (ex.: já autenticado)                              |
+| 4      | autenticação necessária                                            |
+| 5      | registo recusado                                                   |
+| 6      | autenticação falhou                                                |
+| 7      | destinatário desconhecido ou offline                               |
+
+## 3. Registo
+
+1. O cliente gera um par Ed25519 (assinatura) e um par X25519 (acordo de chaves).
+2. Envia REGISTER com o nome, as duas chaves públicas e a prova de posse:
+   `prova = Proofs.signRegister(chavePrivadaEd25519, user, pubSign, pubKex)`.
+3. O relay verifica a prova com a própria chave pública recebida (prova que o cliente
+   tem a chave privada) e valida as duas chaves.
+4. O nome tem de cumprir `[a-z0-9_]{3,32}` e não pode estar já registado.
+5. Resposta: REGISTER_OK, ou ERROR 5 (mesma resposta para qualquer motivo de recusa).
+
+## 4. Autenticação mútua (por ligação)
+
+```
+C -> R  AUTH_HELLO(user)
+R -> C  CHALLENGE(nonce, Assina_relay(msgRelayChallenge(user, nonce)))
+C -> R  AUTH(Assina_user(msgAuth(user, nonce)))
+R -> C  AUTH_OK  (ou ERROR 6)
+```
+
+- O relay prova quem é: o cliente verifica a assinatura do relay com a `relay.pub` que
+  tem guardada (a chave pública do relay, confirmada fora do canal pela impressão digital SHA-256).
+  Um relay falso não tem a chave privada e é detetado.
+- O cliente prova quem é: o relay verifica a resposta com a chave pública registada.
+- O nonce tem 32 bytes aleatórios, é novo em cada ligação e de uso único.
+  O desafio expira em 30 segundos.
+- Uma resposta antiga (replay) não serve numa ligação nova, porque o nonce é diferente.
+- Utilizador desconhecido e assinatura errada recebem a mesma resposta (ERROR 6),
+  para não revelar quais nomes existem.
+- As assinaturas têm um rótulo próprio para cada fim (registo, autenticação, desafio do relay),
+  por isso uma assinatura de um tipo nunca é válida para outro.
+
+## 5. Descoberta e envio
+
+- LOOKUP e SEND só são aceites depois de autenticar (senão ERROR 4).
+- O remetente indicado no DELIVER é SEMPRE o utilizador autenticado na ligação, nunca um
+  valor escrito pelo cliente.
+- O envelope é opaco para o relay: não o abre nem o altera. A confidencialidade, a integridade
+  e a autenticidade da mensagem vêm do envelope E2E (cifra AES-256-GCM e assinatura do remetente),
+  tratado pelo cliente.
+- Se o destinatário não estiver ligado, o relay responde ERROR 7.
+  O armazenamento diferido é da Entrega 2 (MessageStore).
+
+## 6. O que NÃO está protegido (limitações conhecidas)
+
+1. Nonce só do relay: a assinatura do relay não prova ao cliente que o desafio é recente.
+   Um relay falso que tivesse gravado um desafio antigo poderia repeti-lo. Melhoria possível:
+   o cliente também enviar um nonce no AUTH_HELLO e o relay assiná-lo.
+2. Sem canal cifrado entre cliente e relay: um atacante ativo que reencaminhe todas as
+   mensagens (MITM) não está coberto pelo handshake. O conteúdo das mensagens continua
+   protegido pelo envelope E2E.
+3. Sem certificados: a confiança nas chaves públicas dos outros utilizadores depende da
+   verificação da impressão digital (fingerprint) fora do canal.
+4. Disponibilidade: ligações inativas ocupam uma thread do pool (64) até ao timeout de 60 s.
+5. A chave privada do relay (`data/`) fica em claro no disco; quem tiver acesso à máquina
+   do relay pode fazer-se passar por ele.

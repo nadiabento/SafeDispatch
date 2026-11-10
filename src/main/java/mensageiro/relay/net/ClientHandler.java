@@ -9,8 +9,10 @@ import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.security.SecureRandom;
 
-/*Trata UMA ligação de um cliente (corre numa thread do pool).
+/**
+ * Trata UMA ligação de um cliente (corre numa thread do pool).
  * Lê frames em ciclo e trata cada tipo de mensagem.
+ *
  * Regras de segurança:
  *  - Frame ou campos inválidos (ProtocolException): envia ERROR e FECHA a ligação.
  *  - O remetente de uma mensagem é SEMPRE o utilizador autenticado nesta ligação
@@ -32,7 +34,6 @@ public final class ClientHandler implements Runnable {
     static final int MAX_CHAVE = 128;
     static final int MAX_ASSINATURA = 128;
     static final int MAX_ENVELOPE = 512 * 1024;
-    static final int TAMANHO_NONCE = 32;
 
     private static final SecureRandom RANDOM = new SecureRandom();
 
@@ -41,9 +42,9 @@ public final class ClientHandler implements Runnable {
     private final Sessions sessions;
     private OutputStream out;
 
-    /* Utilizador autenticado nesta ligação (null até o handshake terminar com sucesso). */
+    /** Utilizador autenticado nesta ligação (null até o handshake terminar com sucesso). */
     private String utilizador = null;
-    /* Desafio pendente (null se não há). É de uso único. */
+    /** Desafio pendente (null se não há). É de uso único. */
     private Authenticator.Desafio desafio = null;
 
     public ClientHandler(Socket socket, Authenticator authenticator, Sessions sessions) {
@@ -87,7 +88,7 @@ public final class ClientHandler implements Runnable {
         }
     }
 
-    //  REGISTER: nome, chaves e prova de posse
+    // ---------- REGISTER: nome, chaves e prova de posse ----------
     private void registar(byte[] payload) throws IOException {
         var r = new Codec.Reader(payload);
         String user = r.string(MAX_USER);
@@ -96,30 +97,30 @@ public final class ClientHandler implements Runnable {
         byte[] prova = r.bytes(MAX_ASSINATURA);
         r.end();
 
-        byte[] cert = authenticator.registar(user, pubSign, pubKex, prova);
-        if (cert == null) { enviarErro(ERRO_REGISTO_RECUSADO, "registo recusado"); return; }
-        enviar(MessageType.REGISTER_OK, new Codec.Writer().bytes(cert).toByteArray());
+        if (!authenticator.registar(user, pubSign, pubKex, prova)) {
+            enviarErro(ERRO_REGISTO_RECUSADO, "registo recusado");
+            return;
+        }
+        enviar(MessageType.REGISTER_OK, new byte[0]);
     }
 
-    //  Handshake, passo 1: AUTH_HELLO -> CHALLENGE 
+    // ---------- Handshake, passo 1: AUTH_HELLO -> CHALLENGE ----------
     private void iniciarAutenticacao(byte[] payload) throws IOException {
         var r = new Codec.Reader(payload);
         String user = r.string(MAX_USER);
-        byte[] nonceCliente = r.bytes(64);
         r.end();
 
         if (utilizador != null) { enviarErro(ERRO_PEDIDO_INVALIDO, "já autenticado"); return; }
-        if (nonceCliente.length != TAMANHO_NONCE) { enviarErro(ERRO_PEDIDO_INVALIDO, "nonce inválido"); return; }
 
-        Authenticator.Desafio d = authenticator.iniciar(user, nonceCliente);
+        Authenticator.Desafio d = authenticator.iniciar(user);
         // Mesma mensagem para "utilizador desconhecido" e para "assinatura errada"
         if (d == null) { enviarErro(ERRO_AUTENTICACAO, "autenticação falhou"); return; }
         desafio = d;
         enviar(MessageType.CHALLENGE,
-                new Codec.Writer().bytes(d.nonceRelay()).bytes(d.assinaturaRelay()).toByteArray());
+                new Codec.Writer().bytes(d.nonce()).bytes(d.assinaturaRelay()).toByteArray());
     }
 
-    // Handshake, passo 2: AUTH -> AUTH_OK 
+    // ---------- Handshake, passo 2: AUTH -> AUTH_OK ----------
     private void concluirAutenticacao(byte[] payload) throws IOException {
         var r = new Codec.Reader(payload);
         byte[] assinatura = r.bytes(MAX_ASSINATURA);
@@ -136,7 +137,7 @@ public final class ClientHandler implements Runnable {
         enviar(MessageType.AUTH_OK, new Codec.Writer().bytes(new byte[0]).u64(0).toByteArray());
     }
 
-    // LOOKUP: chaves públicas de outro utilizador (+ certificado do relay) 
+    // ---------- LOOKUP: chaves públicas de outro utilizador ----------
     private void procurar(byte[] payload) throws IOException {
         var r = new Codec.Reader(payload);
         String user = r.string(MAX_USER);
@@ -145,12 +146,11 @@ public final class ClientHandler implements Runnable {
 
         Directory.Entry e = authenticator.directory().procurar(user);
         if (e == null) { enviarErro(ERRO_DESTINATARIO, "utilizador desconhecido"); return; }
-        byte[] cert = authenticator.certificado(e.user(), e.pubSign(), e.pubKex());
         enviar(MessageType.LOOKUP_OK, new Codec.Writer()
-                .string(e.user()).bytes(e.pubSign()).bytes(e.pubKex()).bytes(cert).toByteArray());
+                .string(e.user()).bytes(e.pubSign()).bytes(e.pubKex()).toByteArray());
     }
 
-    // SEND: encaminha o envelope para o destinatário, se estiver ligado
+    // ---------- SEND: encaminha o envelope para o destinatário, se estiver ligado ----------
     private void enviar(byte[] payload) throws IOException {
         var r = new Codec.Reader(payload);
         String destinatario = r.string(MAX_USER);
@@ -175,7 +175,7 @@ public final class ClientHandler implements Runnable {
         enviar(MessageType.SEND_OK, new Codec.Writer().bytes(msgId).toByteArray());
     }
 
-    /* Chamado por OUTRA thread (a do remetente) para entregar uma mensagem a este cliente. */
+    /** Chamado por OUTRA thread (a do remetente) para entregar uma mensagem a este cliente. */
     void entregar(String remetente, byte[] msgId, byte[] envelope) throws IOException {
         enviar(MessageType.DELIVER,
                 new Codec.Writer().string(remetente).bytes(msgId).bytes(envelope).toByteArray());
@@ -187,7 +187,7 @@ public final class ClientHandler implements Runnable {
         return false;
     }
 
-    /* Escritas sincronizadas: a thread do remetente e a desta ligação podem escrever ao mesmo tempo. */
+    /** Escritas sincronizadas: a thread do remetente e a desta ligação podem escrever ao mesmo tempo. */
     private void enviar(MessageType tipo, byte[] payload) throws IOException {
         synchronized (out) { Frame.write(out, tipo, payload); }
     }
