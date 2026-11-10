@@ -1,8 +1,10 @@
 package mensageiro.common.crypto;
 
-import javax.crypto.Mac;
-import javax.crypto.spec.SecretKeySpec;
 import java.security.GeneralSecurityException;
+import javax.crypto.Mac;
+import javax.crypto.SecretKeyFactory;
+import javax.crypto.spec.PBEKeySpec;
+import javax.crypto.spec.SecretKeySpec;
 
 /**
  * Derivação de chaves.
@@ -52,5 +54,24 @@ public final class Kdf {
     /** Atalho: extract + expand numa só chamada. */
     public static byte[] hkdf(byte[] salt, byte[] ikm, byte[] info, int length) {
         return hkdfExpand(hkdfExtract(salt, ikm), info, length);
+    }
+
+    // =====================================================================
+    // PBKDF2 (Módulo A): chave derivada de uma palavra-passe
+    // =====================================================================
+
+    /**
+     * PBKDF2WithHmacSHA256. O número de iterações é o que encarece cada tentativa
+     * de um atacante que tenha copiado o ficheiro (ataque offline).
+     */
+    public static byte[] pbkdf2(char[] password, byte[] salt, int iterations, int keyBytes) {
+        PBEKeySpec spec = new PBEKeySpec(password, salt, iterations, keyBytes * 8);
+        try {
+            return SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256").generateSecret(spec).getEncoded();
+        } catch (GeneralSecurityException e) {
+            throw new IllegalStateException("PBKDF2WithHmacSHA256 indisponível", e);
+        } finally {
+            spec.clearPassword();
+        }
     }
 }
