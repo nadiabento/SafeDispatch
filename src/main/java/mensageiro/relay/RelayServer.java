@@ -5,6 +5,7 @@ import mensageiro.relay.auth.Directory;
 import mensageiro.relay.auth.RelayIdentity;
 import mensageiro.relay.net.ClientHandler;
 import mensageiro.relay.net.Sessions;
+import mensageiro.relay.store.MessageStore;
 
 import java.io.IOException;
 import java.net.ServerSocket;
@@ -23,6 +24,7 @@ public final class RelayServer implements AutoCloseable {
 
     private final Authenticator authenticator;
     private final Sessions sessions = new Sessions();
+    private final MessageStore store = new MessageStore();
     private final ExecutorService pool = Executors.newFixedThreadPool(MAX_CLIENTES, r -> {
         Thread t = new Thread(r, "relay-cliente");
         t.setDaemon(true);
@@ -48,7 +50,7 @@ public final class RelayServer implements AutoCloseable {
             while (true) {
                 Socket socket = server.accept();                 // espera por um cliente
                 socket.setSoTimeout(TIMEOUT_INATIVIDADE_MS);     // 60 s parado -> fecha
-                pool.submit(new ClientHandler(socket, authenticator, sessions));
+                pool.submit(new ClientHandler(socket, authenticator, sessions, store));
             }
         } catch (IOException e) {
             // o ServerSocket foi fechado: fim normal

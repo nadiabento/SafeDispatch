@@ -3,11 +3,14 @@ package mensageiro.relay.net;
 import mensageiro.common.protocol.*;
 import mensageiro.relay.auth.Authenticator;
 import mensageiro.relay.auth.Directory;
+import mensageiro.relay.store.MessageStore;
 
 import java.io.*;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.security.SecureRandom;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * Trata UMA ligação de um cliente (corre numa thread do pool).
@@ -28,18 +31,24 @@ public final class ClientHandler implements Runnable {
     static final int ERRO_REGISTO_RECUSADO = 5;
     static final int ERRO_AUTENTICACAO = 6;
     static final int ERRO_DESTINATARIO = 7;
+    static final int ERRO_ARMAZEM_CHEIO = 8;
 
     // Tamanhos máximos dos campos (defesa contra campos forjados)
     static final int MAX_USER = 32;
     static final int MAX_CHAVE = 128;
     static final int MAX_ASSINATURA = 128;
     static final int MAX_ENVELOPE = 512 * 1024;
+    static final int MAX_CONFIRMACOES = 256;          // msgIds que um FETCH pode confirmar
+    static final int TAMANHO_MSGID = 16;
+    static final int MAX_BYTES_POR_FETCH = 900 * 1024; // abaixo do limite de 1 MiB por frame
+    static final int MAX_MSGS_POR_FETCH = 100;
 
     private static final SecureRandom RANDOM = new SecureRandom();
 
     private final Socket socket;
     private final Authenticator authenticator;
     private final Sessions sessions;
+    private final MessageStore store;
     private OutputStream out;
 
     /** Utilizador autenticado nesta ligação (null até o handshake terminar com sucesso). */
@@ -47,10 +56,11 @@ public final class ClientHandler implements Runnable {
     /** Desafio pendente (null se não há). É de uso único. */
     private Authenticator.Desafio desafio = null;
 
-    public ClientHandler(Socket socket, Authenticator authenticator, Sessions sessions) {
+    public ClientHandler(Socket socket, Authenticator authenticator, Sessions sessions, MessageStore store) {
         this.socket = socket;
         this.authenticator = authenticator;
         this.sessions = sessions;
+        this.store = store;
     }
 
     @Override
@@ -84,6 +94,7 @@ public final class ClientHandler implements Runnable {
             case AUTH -> concluirAutenticacao(msg.payload());
             case LOOKUP -> procurar(msg.payload());
             case SEND -> enviar(msg.payload());
+            case FETCH -> levantar(msg.payload());
             default -> enviarErro(ERRO_NAO_IMPLEMENTADO, "não implementado: " + msg.type());
         }
     }
@@ -150,7 +161,7 @@ public final class ClientHandler implements Runnable {
                 .string(e.user()).bytes(e.pubSign()).bytes(e.pubKex()).toByteArray());
     }
 
-    // ---------- SEND: encaminha o envelope para o destinatário, se estiver ligado ----------
+    // ---------- SEND: entrega já se o destinatário estiver ligado, senão guarda ----------
     private void enviar(byte[] payload) throws IOException {
         var r = new Codec.Reader(payload);
         String destinatario = r.string(MAX_USER);
@@ -158,21 +169,56 @@ public final class ClientHandler implements Runnable {
         r.end();
         if (!exigirAutenticado()) return;
 
-        ClientHandler alvo = sessions.obter(destinatario);
-        if (alvo == null) {
-            // TODO Entrega 2: guardar a mensagem (armazenamento diferido)
-            enviarErro(ERRO_DESTINATARIO, "destinatário desconhecido ou offline");
+        // Só se aceitam mensagens para utilizadores registados
+        if (authenticator.directory().procurar(destinatario) == null) {
+            enviarErro(ERRO_DESTINATARIO, "destinatário desconhecido");
             return;
         }
-        byte[] msgId = new byte[16];
+        byte[] msgId = new byte[TAMANHO_MSGID];
         RANDOM.nextBytes(msgId);
-        try {
-            alvo.entregar(utilizador, msgId, envelope);        // 'utilizador' = remetente autenticado
-        } catch (IOException e) {
-            enviarErro(ERRO_DESTINATARIO, "não foi possível entregar");
+
+        boolean entregue = false;
+        ClientHandler alvo = sessions.obter(destinatario);
+        if (alvo != null) {
+            try {
+                alvo.entregar(utilizador, msgId, envelope);    // 'utilizador' = remetente autenticado
+                entregue = true;
+            } catch (IOException e) {
+                // a ligação do destinatário falhou: cai para o armazenamento
+            }
+        }
+        if (!entregue && !store.guardar(destinatario, utilizador, msgId, envelope)) {
+            enviarErro(ERRO_ARMAZEM_CHEIO, "a caixa do destinatário está cheia");
             return;
         }
         enviar(MessageType.SEND_OK, new Codec.Writer().bytes(msgId).toByteArray());
+    }
+
+    // ---------- FETCH: confirma o que já recebeu e levanta as mensagens pendentes ----------
+    // Payload: u32 n, n x bytes(msgId)  (os msgIds recebidos antes, a apagar)
+    // Resposta FETCH_OK: u8 maisPendentes, u32 n, n x (string remetente, bytes msgId, bytes envelope)
+    private void levantar(byte[] payload) throws IOException {
+        var r = new Codec.Reader(payload);
+        long n = r.u32();
+        if (n > MAX_CONFIRMACOES) throw new ProtocolException("confirmações a mais: " + n);
+        List<byte[]> ids = new ArrayList<>();
+        for (long i = 0; i < n; i++) {
+            byte[] id = r.bytes(TAMANHO_MSGID);
+            if (id.length != TAMANHO_MSGID) throw new ProtocolException("msgId inválido");
+            ids.add(id);
+        }
+        r.end();
+        if (!exigirAutenticado()) return;
+
+        // Só apaga da fila do utilizador AUTENTICADO (nunca de outra pessoa)
+        store.confirmar(utilizador, ids);
+
+        List<MessageStore.Mensagem> lote = store.levantar(utilizador, MAX_BYTES_POR_FETCH, MAX_MSGS_POR_FETCH);
+        var w = new Codec.Writer();
+        w.u8(store.pendentes(utilizador) > lote.size() ? 1 : 0);
+        w.u32(lote.size());
+        for (var m : lote) w.string(m.remetente()).bytes(m.msgId()).bytes(m.envelope());
+        enviar(MessageType.FETCH_OK, w.toByteArray());
     }
 
     /** Chamado por OUTRA thread (a do remetente) para entregar uma mensagem a este cliente. */
