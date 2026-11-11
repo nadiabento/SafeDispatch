@@ -81,9 +81,11 @@ public final class TestRunner {
         }
 
         // Estilo testXxx (testes da Nadia)
-        for (Class<?> c : new Class<?>[]{SmokeTest.class, FrameTest.class, CodecTest.class, RelayIdentityTest.class, AuthTest.class}) {
+        for (Class<?> c : new Class<?>[]{SmokeTest.class, FrameTest.class, CodecTest.class, RelayIdentityTest.class, AuthTest.class, StoreTest.class, TokenTest.class}) {
             registerTestMethods(c);
         }
+
+        
 
         int ok = 0, fail = 0;
         for (Case c : CASES) {

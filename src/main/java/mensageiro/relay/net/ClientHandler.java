@@ -4,6 +4,7 @@ import mensageiro.common.protocol.*;
 import mensageiro.relay.auth.Authenticator;
 import mensageiro.relay.auth.Directory;
 import mensageiro.relay.store.MessageStore;
+import mensageiro.relay.token.TokenService;
 
 import java.io.*;
 import java.net.Socket;
@@ -21,6 +22,7 @@ import java.util.List;
  *  - O remetente de uma mensagem é SEMPRE o utilizador autenticado nesta ligação
  *    (campo 'utilizador'), nunca algo que o cliente escreva.
  *  - O relay trata o envelope como bytes opacos: não o abre, não o altera.
+ *  - Levantar mensagens (FETCH) exige um token válido que pertença ao utilizador desta ligação.
  */
 public final class ClientHandler implements Runnable {
     // Códigos de erro (1.º campo do payload de ERROR)
@@ -32,6 +34,7 @@ public final class ClientHandler implements Runnable {
     static final int ERRO_AUTENTICACAO = 6;
     static final int ERRO_DESTINATARIO = 7;
     static final int ERRO_ARMAZEM_CHEIO = 8;
+    static final int ERRO_TOKEN = 9;
 
     // Tamanhos máximos dos campos (defesa contra campos forjados)
     static final int MAX_USER = 32;
@@ -49,6 +52,7 @@ public final class ClientHandler implements Runnable {
     private final Authenticator authenticator;
     private final Sessions sessions;
     private final MessageStore store;
+    private final TokenService tokens;
     private OutputStream out;
 
     /** Utilizador autenticado nesta ligação (null até o handshake terminar com sucesso). */
@@ -56,11 +60,13 @@ public final class ClientHandler implements Runnable {
     /** Desafio pendente (null se não há). É de uso único. */
     private Authenticator.Desafio desafio = null;
 
-    public ClientHandler(Socket socket, Authenticator authenticator, Sessions sessions, MessageStore store) {
+    public ClientHandler(Socket socket, Authenticator authenticator, Sessions sessions,
+                         MessageStore store, TokenService tokens) {
         this.socket = socket;
         this.authenticator = authenticator;
         this.sessions = sessions;
         this.store = store;
+        this.tokens = tokens;
     }
 
     @Override
@@ -95,6 +101,7 @@ public final class ClientHandler implements Runnable {
             case LOOKUP -> procurar(msg.payload());
             case SEND -> enviar(msg.payload());
             case FETCH -> levantar(msg.payload());
+            case RENEW -> renovar(msg.payload());
             default -> enviarErro(ERRO_NAO_IMPLEMENTADO, "não implementado: " + msg.type());
         }
     }
@@ -131,7 +138,7 @@ public final class ClientHandler implements Runnable {
                 new Codec.Writer().bytes(d.nonce()).bytes(d.assinaturaRelay()).toByteArray());
     }
 
-    // ---------- Handshake, passo 2: AUTH -> AUTH_OK ----------
+    // ---------- Handshake, passo 2: AUTH -> AUTH_OK (com o token) ----------
     private void concluirAutenticacao(byte[] payload) throws IOException {
         var r = new Codec.Reader(payload);
         byte[] assinatura = r.bytes(MAX_ASSINATURA);
@@ -144,8 +151,9 @@ public final class ClientHandler implements Runnable {
 
         utilizador = d.utilizador();
         sessions.registar(utilizador, this);
-        // TODO módulo C: aqui vai o token. Por agora vai vazio, com expiração 0.
-        enviar(MessageType.AUTH_OK, new Codec.Writer().bytes(new byte[0]).u64(0).toByteArray());
+        // O token que o cliente vai apresentar nos pedidos seguintes (FETCH, RENEW)
+        TokenService.Token t = tokens.emitir(utilizador, TokenService.ESCOPO_LEVANTAR);
+        enviar(MessageType.AUTH_OK, new Codec.Writer().bytes(t.bytes()).u64(t.expiraEm()).toByteArray());
     }
 
     // ---------- LOOKUP: chaves públicas de outro utilizador ----------
@@ -194,11 +202,12 @@ public final class ClientHandler implements Runnable {
         enviar(MessageType.SEND_OK, new Codec.Writer().bytes(msgId).toByteArray());
     }
 
-    // ---------- FETCH: confirma o que já recebeu e levanta as mensagens pendentes ----------
-    // Payload: u32 n, n x bytes(msgId)  (os msgIds recebidos antes, a apagar)
+    // ---------- FETCH: levanta as mensagens pendentes (exige token) ----------
+    // Payload: bytes token, u32 n, n x bytes(msgId)  (os msgIds recebidos antes, a apagar)
     // Resposta FETCH_OK: u8 maisPendentes, u32 n, n x (string remetente, bytes msgId, bytes envelope)
     private void levantar(byte[] payload) throws IOException {
         var r = new Codec.Reader(payload);
+        byte[] token = r.bytes(TokenService.MAX_TOKEN);
         long n = r.u32();
         if (n > MAX_CONFIRMACOES) throw new ProtocolException("confirmações a mais: " + n);
         List<byte[]> ids = new ArrayList<>();
@@ -209,6 +218,7 @@ public final class ClientHandler implements Runnable {
         }
         r.end();
         if (!exigirAutenticado()) return;
+        if (!tokenValido(token)) { enviarErro(ERRO_TOKEN, "token inválido ou expirado"); return; }
 
         // Só apaga da fila do utilizador AUTENTICADO (nunca de outra pessoa)
         store.confirmar(utilizador, ids);
@@ -219,6 +229,26 @@ public final class ClientHandler implements Runnable {
         w.u32(lote.size());
         for (var m : lote) w.string(m.remetente()).bytes(m.msgId()).bytes(m.envelope());
         enviar(MessageType.FETCH_OK, w.toByteArray());
+    }
+
+    // ---------- RENEW: troca um token válido por outro com nova expiração ----------
+    // Payload: bytes token.  Resposta RENEW_OK: bytes token, u64 expiração
+    private void renovar(byte[] payload) throws IOException {
+        var r = new Codec.Reader(payload);
+        byte[] token = r.bytes(TokenService.MAX_TOKEN);
+        r.end();
+        if (!exigirAutenticado()) return;
+        if (!tokenValido(token)) { enviarErro(ERRO_TOKEN, "token inválido ou expirado"); return; }
+
+        TokenService.Token novo = tokens.renovar(token);
+        if (novo == null) { enviarErro(ERRO_TOKEN, "sessão demasiado longa: autentica de novo"); return; }
+        enviar(MessageType.RENEW_OK, new Codec.Writer().bytes(novo.bytes()).u64(novo.expiraEm()).toByteArray());
+    }
+
+    /** O token é válido, tem o âmbito certo e PERTENCE ao utilizador autenticado nesta ligação. */
+    private boolean tokenValido(byte[] token) {
+        TokenService.Dados d = tokens.verificar(token, TokenService.ESCOPO_LEVANTAR);
+        return d != null && d.utilizador().equals(utilizador);
     }
 
     /** Chamado por OUTRA thread (a do remetente) para entregar uma mensagem a este cliente. */

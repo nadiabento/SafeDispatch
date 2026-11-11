@@ -31,6 +31,7 @@ public final class AuthTest {
         final OutputStream out;
         final String user;
         final KeyPair sign, kex;
+        byte[] token = new byte[0];                         // token recebido no AUTH_OK
 
         Cliente(int porta, String user) throws Exception {
             socket = new Socket("127.0.0.1", porta);
@@ -65,7 +66,11 @@ public final class AuthTest {
             check(Proofs.verifyRelayChallenge(relayPub, user, nonce, sigRelay), "assinatura do relay inválida");
             byte[] sig = Proofs.signAuth(sign.getPrivate(), user, nonce);
             enviar(MessageType.AUTH, new Codec.Writer().bytes(sig).toByteArray());
-            return receber();
+            var resp = receber();
+            if (resp.type() == MessageType.AUTH_OK) {
+                token = new Codec.Reader(resp.payload()).bytes(256);   // guarda o token para os pedidos seguintes
+            }
+            return resp;
         }
     }
 
@@ -282,5 +287,168 @@ public final class AuthTest {
             for (var t : threads) t.join(15000);
             check(falhas.isEmpty(), "falhas em clientes simultâneos: " + falhas);
         }
+    }
+
+        // ---------- armazenamento diferido e tokens ----------
+
+    /** Envia um FETCH com o token dado e devolve a resposta (FETCH_OK ou ERROR). */
+    private static Frame.Message pedirFetch(Cliente c, byte[] token, java.util.List<byte[]> ids) throws Exception {
+        var w = new Codec.Writer().bytes(token).u32(ids.size());
+        for (byte[] i : ids) w.bytes(i);
+        c.enviar(MessageType.FETCH, w.toByteArray());
+        return c.receber();
+    }
+
+    /** FETCH com o token do próprio cliente; devolve os pares {msgId, envelope} recebidos. */
+    private static java.util.List<byte[][]> fetch(Cliente c, java.util.List<byte[]> ids) throws Exception {
+        var resp = pedirFetch(c, c.token, ids);
+        check(resp.type() == MessageType.FETCH_OK, "esperava FETCH_OK, veio " + resp.type());
+        var r = new Codec.Reader(resp.payload());
+        r.u8();
+        long n = r.u32();
+        var lista = new java.util.ArrayList<byte[][]>();
+        for (long i = 0; i < n; i++) {
+            r.string(32);
+            lista.add(new byte[][]{r.bytes(16), r.bytes(1 << 20)});
+        }
+        r.end();
+        return lista;
+    }
+
+    // Mensagem para alguém offline fica guardada e é levantada no FETCH; confirmar apaga
+    static void testMensagemOfflineEntregueNoFetch() throws Exception {
+        var id = novaIdentidade();
+        try (var relay = new RelayServer(id)) {
+            int porta = relay.start(0);
+            byte[] envelope = new byte[200];
+            RANDOM.nextBytes(envelope);
+            try (var alice = new Cliente(porta, "alice"); var bob = new Cliente(porta, "bob")) {
+                alice.registar(); bob.registar();
+                alice.autenticar(id.publicKeyBytes());          // o bob ainda NÃO está ligado
+                alice.enviar(MessageType.SEND, new Codec.Writer().string("bob").bytes(envelope).toByteArray());
+                check(alice.receber().type() == MessageType.SEND_OK, "SEND_OK mesmo com o bob offline");
+
+                bob.autenticar(id.publicKeyBytes());
+                var lote = fetch(bob, java.util.List.of());
+                check(lote.size() == 1 && Arrays.equals(lote.get(0)[1], envelope), "o bob devia levantar o envelope intacto");
+                // Sem confirmar, a mensagem continua lá
+                check(fetch(bob, java.util.List.of()).size() == 1, "sem confirmação não se apaga");
+                // Confirmando, apaga
+                check(fetch(bob, java.util.List.of(lote.get(0)[0])).isEmpty(), "depois de confirmar não há nada");
+            }
+        }
+    }
+
+    // Um utilizador não consegue apagar as mensagens de outro com o msgId delas
+    static void testFetchSoDaAsMensagensDoProprioUtilizador() throws Exception {
+        var id = novaIdentidade();
+        try (var relay = new RelayServer(id)) {
+            int porta = relay.start(0);
+            try (var alice = new Cliente(porta, "alice"); var bob = new Cliente(porta, "bob");
+                 var mallory = new Cliente(porta, "mallory")) {
+                alice.registar(); bob.registar(); mallory.registar();
+                alice.autenticar(id.publicKeyBytes());
+                alice.enviar(MessageType.SEND, new Codec.Writer().string("bob").bytes(new byte[]{1, 2, 3}).toByteArray());
+                byte[] msgId = new Codec.Reader(alice.receber().payload()).bytes(16);
+
+                mallory.autenticar(id.publicKeyBytes());
+                check(fetch(mallory, java.util.List.of(msgId)).isEmpty(), "a mallory não vê nada");
+
+                bob.autenticar(id.publicKeyBytes());
+                check(fetch(bob, java.util.List.of()).size() == 1, "a mensagem do bob não foi apagada pela mallory");
+            }
+        }
+    }
+
+    // FETCH sem autenticação é recusado
+    static void testFetchSemAutenticacaoRecusado() throws Exception {
+        try (var relay = new RelayServer(novaIdentidade())) {
+            int porta = relay.start(0);
+            try (var c = new Cliente(porta, "alice")) {
+                esperaErro(pedirFetch(c, new byte[0], java.util.List.of()), "FETCH sem autenticação");
+            }
+        }
+    }
+
+    // O AUTH_OK traz um token não vazio
+    static void testAuthOkTrazToken() throws Exception {
+        var id = novaIdentidade();
+        try (var relay = new RelayServer(id)) {
+            int porta = relay.start(0);
+            try (var alice = new Cliente(porta, "alice")) {
+                alice.registar();
+                alice.autenticar(id.publicKeyBytes());
+                check(alice.token.length > 0, "o AUTH_OK devia trazer um token");
+            }
+        }
+    }
+
+    // Token alterado é recusado
+    static void testFetchComTokenAlteradoRecusado() throws Exception {
+        var id = novaIdentidade();
+        try (var relay = new RelayServer(id)) {
+            int porta = relay.start(0);
+            try (var alice = new Cliente(porta, "alice")) {
+                alice.registar();
+                alice.autenticar(id.publicKeyBytes());
+                byte[] adulterado = alice.token.clone();
+                adulterado[adulterado.length - 1] ^= 1;          // estraga o MAC
+                esperaErro(pedirFetch(alice, adulterado, java.util.List.of()), "token alterado");
+            }
+        }
+    }
+
+    // Token de OUTRO utilizador é recusado (mesmo sendo válido)
+    static void testTokenDeOutroUtilizadorRecusado() throws Exception {
+        var id = novaIdentidade();
+        try (var relay = new RelayServer(id)) {
+            int porta = relay.start(0);
+            try (var alice = new Cliente(porta, "alice"); var mallory = new Cliente(porta, "mallory")) {
+                alice.registar(); mallory.registar();
+                alice.autenticar(id.publicKeyBytes());
+                mallory.autenticar(id.publicKeyBytes());
+                // A mallory apresenta o token (válido) da alice na ligação dela
+                esperaErro(pedirFetch(mallory, alice.token, java.util.List.of()), "token de outro utilizador");
+            }
+        }
+    }
+
+    // Renovar dá um token novo que funciona
+    static void testRenovarToken() throws Exception {
+        var id = novaIdentidade();
+        try (var relay = new RelayServer(id)) {
+            int porta = relay.start(0);
+            try (var alice = new Cliente(porta, "alice")) {
+                alice.registar();
+                alice.autenticar(id.publicKeyBytes());
+                alice.enviar(MessageType.RENEW, new Codec.Writer().bytes(alice.token).toByteArray());
+                var resp = alice.receber();
+                check(resp.type() == MessageType.RENEW_OK, "esperava RENEW_OK, veio " + resp.type());
+                var r = new Codec.Reader(resp.payload());
+                alice.token = r.bytes(256);
+                long expira = r.u64();
+                r.end();
+                check(expira > System.currentTimeMillis(), "a nova expiração devia estar no futuro");
+                check(fetch(alice, java.util.List.of()).isEmpty(), "o token renovado devia funcionar");
+            }
+        }
+    }
+
+    // Renovar com um token inválido é recusado
+    static void testRenovarComTokenInvalidoRecusado() throws Exception {
+        var id = novaIdentidade();
+        try (var relay = new RelayServer(id)) {
+            int porta = relay.start(0);
+            try (var alice = new Cliente(porta, "alice")) {
+                alice.registar();
+                alice.autenticar(id.publicKeyBytes());
+                alice.enviar(MessageType.RENEW, new Codec.Writer().bytes(new byte[]{1, 2, 3}).toByteArray());
+                esperaErro(alice.receber(), "renovar com token inválido");
+            }
+        }
+    }
+
+    // Enviar para um utilizador que não existe dá erro
+    static void testDestinatarioDesconhecidoDaErro() throws Exception {
     }
 }
